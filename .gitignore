@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 학습 산출물 (가중치, 로그 등)
+models/*
+!models/.gitkeep
+
+# 데이터셋 (Roboflow에서 export한 이미지/라벨 원본)
+m16image/
