@@ -10,6 +10,7 @@ from firebase_config import get_db
 WEAPONS = [
     {
         "code": "k1",
+        "displayName": "K-1A",           # Flutter 표시명 (Weapon.yoloToDisplayName과 일치)
         "officialName": "K1 기관단총",
         "type": "기관단총",
         "caliber": "5.56x45mm (KM193 / K100 혼용)",
@@ -17,12 +18,14 @@ WEAPONS = [
         "developedBy": "국방과학연구소(ADD)",
         "description": "K2보다 앞서 개발된 국내 최초 독자 개발 소화기. "
                        "K2와 하부 총몸이 호환되며 특수전사령부 등에서 주로 운용된다.",
+        "authorizedQuantity": 8,          # 편제 정수 (부대 편제표 기준으로 수정 가능)
         "specsVerified": False,
         "overallLengthMm": None,
         "weightKg": None,
     },
     {
         "code": "k2",
+        "displayName": "K-2",
         "officialName": "K2 소총",
         "type": "돌격소총",
         "caliber": "5.56x45mm NATO (KM193 / K100 혼용)",
@@ -30,12 +33,14 @@ WEAPONS = [
         "developedBy": "국방과학연구소(ADD)",
         "description": "1984년 정식 제식명을 받아 1985년부터 전방 전투부대에 우선 보급된 "
                        "대한민국 육군의 주력 제식 돌격소총. M16 소총과 탄창이 호환된다.",
+        "authorizedQuantity": 14,
         "specsVerified": False,
         "overallLengthMm": None,
         "weightKg": None,
     },
     {
         "code": "k2c1",
+        "displayName": "K2C1",
         "officialName": "K2C1 소총",
         "type": "돌격소총(K2 개량형)",
         "caliber": "5.56x45mm NATO (K2와 동일)",
@@ -43,6 +48,7 @@ WEAPONS = [
         "developedBy": "S&T모티브 / 육군본부",
         "description": "2014년 개발에 착수해 2016년부터 전방부대에 보급된 K2의 개량형. "
                        "신축형 개머리판과 피카티니 레일이 추가됐고 내부 구조·성능은 K2와 동일하다.",
+        "authorizedQuantity": 10,
         "specsVerified": False,
         "overallLengthMm": None,
         "weightKg": None,

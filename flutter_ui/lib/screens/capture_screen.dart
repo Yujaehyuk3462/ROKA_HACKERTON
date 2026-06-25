@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -7,6 +8,8 @@ import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 import 'package:image_picker/image_picker.dart';
 
+import '../models/weapon.dart';
+import '../repositories/weapon_repository.dart';
 import '../theme.dart';
 
 enum _ScreenState { idle, loading, result }
@@ -18,31 +21,15 @@ class CaptureScreen extends StatefulWidget {
   State<CaptureScreen> createState() => _CaptureScreenState();
 }
 
-class _ModelSpec {
-  final int authorized;
-  final String serial;
-  const _ModelSpec(this.authorized, this.serial);
-}
+// UI 표시 순서 고정 (Firestore 문서 순서 무관)
+const _weaponOrder = ['K-2', 'K-1A', 'K2C1'];
 
-const _models = <String, _ModelSpec>{
-  'K-2': _ModelSpec(14, 'K2-2231140'),
-  'K-1A': _ModelSpec(8, 'K1A-100742'),
-  'K2C1': _ModelSpec(10, 'K2C1-04412'),
+// 총번은 개체별 데이터이므로 기종 대표 예시값을 폴백으로 유지
+const _defaultSerials = {
+  'K-2': 'K2-2231140',
+  'K-1A': 'K1A-100742',
+  'K2C1': 'K2C1-04412',
 };
-
-// YOLO 클래스명(소문자) → Flutter 표시명 (data_no_m16.yaml: 0=k1, 1=k2c1, 2=k2)
-String _mapYoloClass(String cls) {
-  switch (cls.toLowerCase()) {
-    case 'k2':
-      return 'K-2';
-    case 'k1':
-      return 'K-1A';
-    case 'k2c1':
-      return 'K2C1';
-    default:
-      return 'K-2';
-  }
-}
 
 class _CaptureScreenState extends State<CaptureScreen> {
   _ScreenState _screenState = _ScreenState.idle;
@@ -57,9 +44,6 @@ class _CaptureScreenState extends State<CaptureScreen> {
   List<Map<String, dynamic>> _confirmedDetections = []; // confirmedDetections
   Map<String, int> _summary = {};                       // summary
 
-  // ── weapons 컬렉션에서 불러온 총기 상세 ────────────────
-  Map<String, dynamic>? _weaponDetail;
-
   // ── 사용자 입력 ─────────────────────────────────────────
   String _condition = 'good';
   final _remarksController = TextEditingController();
@@ -67,26 +51,49 @@ class _CaptureScreenState extends State<CaptureScreen> {
   // ── 저장 중 플래그 ──────────────────────────────────────
   bool _saving = false;
 
-  int get _authorized => _models[_model]!.authorized;
-  String get _serial => _models[_model]!.serial;
+  // ── 총기 데이터 (Firestore weapons 실시간 스트림) ────────
+  Map<String, Weapon> _weaponMap = Map.of(Weapon.fallbacks);
+  StreamSubscription<Map<String, Weapon>>? _weaponSub;
+
+  int get _authorized => _weaponMap[_model]?.authorizedQuantity ?? 0;
+  String get _serial => _defaultSerials[_model] ?? '-';
   static const _unit = '정';
   static const _serverUrl = 'http://192.168.45.16:8000/detect';
   static const _modelVersion = 'firearms_yolo_no_m16';
 
   @override
+  void initState() {
+    super.initState();
+    _weaponSub = WeaponRepository.watchAllByDisplayName().listen(
+      (map) { if (mounted) setState(() => _weaponMap = map); },
+      onError: (_) {},
+    );
+    // 화면이 빌드된 직후 바로 카메라 실행
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _captureAndDetect(ImageSource.camera, isInitial: true);
+    });
+  }
+
+  @override
   void dispose() {
+    _weaponSub?.cancel();
     _remarksController.dispose();
     super.dispose();
   }
 
-  // ════════════ 1단계: 카메라 촬영 → YOLO 서버 → weapons 조회 ════════════
-  Future<void> _captureAndDetect() async {
+  // ════════════ 1단계: 카메라 촬영 or 갤러리 → YOLO 서버 ════════════
+  Future<void> _captureAndDetect(ImageSource source,
+      {bool isInitial = false}) async {
     final picker = ImagePicker();
     final XFile? photo = await picker.pickImage(
-      source: ImageSource.camera,
+      source: source,
       imageQuality: 85,
     );
-    if (photo == null) return;
+    if (photo == null) {
+      // 최초 실행(화면 오픈 직후) 취소 → 화면 닫기
+      if (isInitial && mounted) Navigator.pop(context);
+      return;
+    }
 
     setState(() => _screenState = _ScreenState.loading);
 
@@ -124,34 +131,21 @@ class _CaptureScreenState extends State<CaptureScreen> {
       // 가장 많이 탐지된 YOLO 클래스
       final dominantYolo =
           counts.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
-      final mappedModel = _mapYoloClass(dominantYolo);
+      final mappedModel = Weapon.yoloToDisplayName(dominantYolo);
       final maxConf = detections.isEmpty
           ? 0.0
           : detections
               .map((d) => (d['confidence'] as num).toDouble())
               .reduce((a, b) => a > b ? a : b);
 
-      // ── weapons 컬렉션에서 총기 상세 조회 ──
-      // 문서 ID = YOLO 클래스명 (seed_weapons.py와 동일한 키: k1, k2, k2c1)
-      Map<String, dynamic>? weaponDetail;
-      try {
-        final weaponDoc = await FirebaseFirestore.instance
-            .collection('weapons')
-            .doc(dominantYolo) // 예: "k2"
-            .get();
-        if (weaponDoc.exists) weaponDetail = weaponDoc.data();
-      } catch (_) {
-        // weapons 조회 실패는 치명적이지 않으므로 무시하고 계속 진행
-      }
-
+      // weapons 제원은 initState에서 구독 중인 _weaponMap에서 즉시 사용 가능
       setState(() {
-        _model = _models.containsKey(mappedModel) ? mappedModel : 'K-2';
+        _model = _weaponMap.containsKey(mappedModel) ? mappedModel : 'K-2';
         _qty = counts[dominantYolo] ?? 0;
         _confidence = maxConf;
         _annotatedBytes = base64Decode(annotatedB64);
         _confirmedDetections = detections; // detectionRecords.confirmedDetections
         _summary = counts;                  // detectionRecords.summary
-        _weaponDetail = weaponDetail;
         _screenState = _ScreenState.result;
       });
     } catch (e) {
@@ -345,7 +339,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
                           color: const Color(0xA612121A),
                           borderRadius: BorderRadius.circular(999),
                         ),
-                        child: Text('품목을 프레임 안에 맞추고 촬영하세요',
+                        child: Text('아래 버튼으로 촬영하거나 갤러리에서 선택하세요',
                             style: T.sans(
                                 size: 12.5,
                                 weight: FontWeight.w500,
@@ -362,9 +356,14 @@ class _CaptureScreenState extends State<CaptureScreen> {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                const SizedBox(width: 46, height: 46),
+                // 갤러리 선택 버튼
+                _roundBtn(
+                  Icons.photo_library_outlined,
+                  onTap: () => _captureAndDetect(ImageSource.gallery),
+                  iconColor: AppColors.textSub,
+                ),
                 GestureDetector(
-                  onTap: _captureAndDetect,
+                  onTap: () => _captureAndDetect(ImageSource.camera),
                   child: Container(
                     width: 78,
                     height: 78,
@@ -534,11 +533,8 @@ class _CaptureScreenState extends State<CaptureScreen> {
               _quantityCard(statusLabel, statusColor),
               const SizedBox(height: 13),
               _conditionRow(),
-              // weapons 컬렉션 조회 결과 카드 (데이터 있을 때만 표시)
-              if (_weaponDetail != null) ...[
-                const SizedBox(height: 13),
-                _weaponDetailCard(),
-              ],
+              const SizedBox(height: 13),
+              _weaponDetailCard(),
               const SizedBox(height: 13),
               _noteRow(),
             ],
@@ -836,9 +832,9 @@ class _CaptureScreenState extends State<CaptureScreen> {
           const SizedBox(height: 11),
           Row(
             children: [
-              for (final name in _models.keys) ...[
+              for (final name in _weaponOrder) ...[
                 _modelChip(name),
-                if (name != _models.keys.last)
+                if (name != _weaponOrder.last)
                   const SizedBox(width: 8),
               ],
             ],
@@ -1089,12 +1085,13 @@ class _CaptureScreenState extends State<CaptureScreen> {
   // weapons/{yolo_class_id} 문서의 officialName, type, caliber,
   // manufacturer, description 필드를 표시한다.
   Widget _weaponDetailCard() {
-    final d = _weaponDetail!;
-    final officialName = d['officialName'] as String? ?? _model;
-    final type = d['type'] as String? ?? '-';
-    final caliber = d['caliber'] as String? ?? '-';
-    final manufacturer = d['manufacturer'] as String? ?? '-';
-    final description = d['description'] as String? ?? '';
+    final w = _weaponMap[_model];
+    if (w == null) return const SizedBox.shrink();
+    final officialName = w.officialName;
+    final type = w.type;
+    final caliber = w.caliber;
+    final manufacturer = w.manufacturer;
+    final description = w.description;
 
     return _panel(
       child: Column(
@@ -1305,7 +1302,6 @@ class _CaptureScreenState extends State<CaptureScreen> {
                     _qty = 0;
                     _confirmedDetections = [];
                     _summary = {};
-                    _weaponDetail = null;
                     _remarksController.clear();
                   });
                 },

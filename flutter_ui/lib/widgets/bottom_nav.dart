@@ -15,15 +15,17 @@ class AppBottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // 삼성 3버튼 내비게이션 바 등 시스템 UI 영역 높이를 동적으로 반영
+    final systemBottom = MediaQuery.of(context).padding.bottom;
     return Stack(
       clipBehavior: Clip.none,
       alignment: Alignment.topCenter,
       children: [
         // 네비게이션 바 본체
         Container(
-          padding: const EdgeInsets.fromLTRB(14, 9, 14, 26),
+          padding: EdgeInsets.fromLTRB(14, 9, 14, 8 + systemBottom),
           decoration: const BoxDecoration(
-            color: Color(0xFF1A1A1C), // 완전 불투명으로 변경
+            color: Color(0xFF1A1A1C),
             border: Border(top: BorderSide(color: Color(0x12FFFFFF))),
           ),
           child: Row(

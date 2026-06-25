@@ -2,6 +2,14 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import '../theme.dart';
 
+/// capturedAt 필드는 Firestore Timestamp(Flutter 저장) 또는
+/// ISO 8601 String(Python detection_store.py 저장) 두 형태가 혼재할 수 있음
+DateTime? _parseTs(dynamic v) {
+  if (v is Timestamp) return v.toDate();
+  if (v is String) return DateTime.tryParse(v);
+  return null;
+}
+
 class HistoryScreen extends StatelessWidget {
   const HistoryScreen({super.key});
 
@@ -127,10 +135,7 @@ class HistoryScreen extends StatelessWidget {
     final authorized = (data['authorizedQuantity'] as num?)?.toInt() ?? 0;
     final condition = data['condition'] as String? ?? 'good';
     final remarks = (data['remarks'] as String? ?? '').trim();
-    final capturedAt = data['capturedAt'] as Timestamp?;
-
-    final dateStr =
-        capturedAt != null ? _fmtDate(capturedAt.toDate()) : '-';
+    final dateStr = _fmtDate(_parseTs(data['capturedAt']));
     final shortage = authorized - qty;
 
     final conditionLabel = switch (condition) {
@@ -261,7 +266,8 @@ class HistoryScreen extends StatelessWidget {
     );
   }
 
-  String _fmtDate(DateTime dt) {
+  String _fmtDate(DateTime? dt) {
+    if (dt == null) return '-';
     final mm = dt.month.toString().padLeft(2, '0');
     final dd = dt.day.toString().padLeft(2, '0');
     final hh = dt.hour.toString().padLeft(2, '0');
