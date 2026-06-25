@@ -44,10 +44,6 @@ const _data = <_Model>[
     _Serial('K2C1-04412', '양호', ok: true),
     _Serial('K2C1-04413', '정비요'),
   ]),
-  _Model('M16A1', '5.56mm 보통탄 · 화기류', 6, 6, '06.20', [
-    _Serial('M16A1-77310', '양호', ok: true),
-    _Serial('M16A1-77311', '양호', ok: true),
-  ]),
 ];
 
 class _InventoryListScreenState extends State<InventoryListScreen> {
@@ -97,18 +93,18 @@ class _InventoryListScreenState extends State<InventoryListScreen> {
         children: [
           Text('기종별 재고', style: T.sans(size: 22, weight: FontWeight.w800, letterSpacing: -0.2)),
           const SizedBox(height: 2),
-          Text('학습 기종 4종 · 총 38정 보유',
+          Text('학습 기종 3종 · 총 32정 보유',
               style: T.sans(size: 12.5, weight: FontWeight.w500, color: AppColors.textSub)),
           const SizedBox(height: 14),
           _search(),
           const SizedBox(height: 12),
           Row(
             children: [
-              _chip('전체 4', 'all'),
+              _chip('전체 3', 'all'),
               const SizedBox(width: 8),
               _chip('부족 2', 'short'),
               const SizedBox(width: 8),
-              _chip('정수일치 2', 'ok'),
+              _chip('정수일치 1', 'ok'),
             ],
           ),
         ],

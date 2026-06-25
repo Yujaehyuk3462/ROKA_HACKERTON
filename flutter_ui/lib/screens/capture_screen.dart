@@ -1,7 +1,16 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
+import 'package:image_picker/image_picker.dart';
+
 import '../theme.dart';
 
-/// 촬영 → 인식 → 수량 입력 (전체화면). 카메라 뷰파인더 ↔ 등록 폼 상태 전환.
+enum _ScreenState { idle, loading, result }
+
 class CaptureScreen extends StatefulWidget {
   const CaptureScreen({super.key});
 
@@ -19,24 +28,237 @@ const _models = <String, _ModelSpec>{
   'K-2': _ModelSpec(14, 'K2-2231140'),
   'K-1A': _ModelSpec(8, 'K1A-100742'),
   'K2C1': _ModelSpec(10, 'K2C1-04412'),
-  'M16A1': _ModelSpec(6, 'M16A1-77310'),
 };
 
+// YOLO 클래스명(소문자) → Flutter 표시명 (data_no_m16.yaml: 0=k1, 1=k2c1, 2=k2)
+String _mapYoloClass(String cls) {
+  switch (cls.toLowerCase()) {
+    case 'k2':
+      return 'K-2';
+    case 'k1':
+      return 'K-1A';
+    case 'k2c1':
+      return 'K2C1';
+    default:
+      return 'K-2';
+  }
+}
+
 class _CaptureScreenState extends State<CaptureScreen> {
-  bool _captured = false;
+  _ScreenState _screenState = _ScreenState.idle;
+
+  // ── YOLO 서버 응답 ─────────────────────────────────────
   String _model = 'K-2';
-  int _qty = 12;
-  String _condition = 'good'; // good | repair | unusable
+  int _qty = 0;
+  double _confidence = 0.0;
+  Uint8List? _annotatedBytes;
+
+  // detectionRecords 스키마에 맞춘 원본 필드
+  List<Map<String, dynamic>> _confirmedDetections = []; // confirmedDetections
+  Map<String, int> _summary = {};                       // summary
+
+  // ── weapons 컬렉션에서 불러온 총기 상세 ────────────────
+  Map<String, dynamic>? _weaponDetail;
+
+  // ── 사용자 입력 ─────────────────────────────────────────
+  String _condition = 'good';
+  final _remarksController = TextEditingController();
+
+  // ── 저장 중 플래그 ──────────────────────────────────────
+  bool _saving = false;
 
   int get _authorized => _models[_model]!.authorized;
   String get _serial => _models[_model]!.serial;
   static const _unit = '정';
+  static const _serverUrl = 'http://192.168.45.16:8000/detect';
+  static const _modelVersion = 'firearms_yolo_no_m16';
+
+  @override
+  void dispose() {
+    _remarksController.dispose();
+    super.dispose();
+  }
+
+  // ════════════ 1단계: 카메라 촬영 → YOLO 서버 → weapons 조회 ════════════
+  Future<void> _captureAndDetect() async {
+    final picker = ImagePicker();
+    final XFile? photo = await picker.pickImage(
+      source: ImageSource.camera,
+      imageQuality: 85,
+    );
+    if (photo == null) return;
+
+    setState(() => _screenState = _ScreenState.loading);
+
+    try {
+      // ── YOLO 서버 전송 ──
+      final request = http.MultipartRequest('POST', Uri.parse(_serverUrl))
+        ..files.add(await http.MultipartFile.fromPath(
+          'file',
+          photo.path,
+          contentType: MediaType('image', 'jpeg'),
+        ));
+
+      final streamed = await request.send().timeout(const Duration(seconds: 30));
+      final response = await http.Response.fromStream(streamed);
+
+      if (response.statusCode != 200) {
+        _showError('서버 오류 (${response.statusCode})');
+        setState(() => _screenState = _ScreenState.idle);
+        return;
+      }
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      // detectionRecords 스키마 필드명으로 파싱
+      final counts = Map<String, int>.from(data['counts'] as Map);
+      final detections =
+          (data['detections'] as List).cast<Map<String, dynamic>>();
+      final annotatedB64 = data['annotatedImage'] as String;
+
+      if (counts.isEmpty) {
+        _showError('총기류가 인식되지 않았습니다. 다시 촬영해 주세요.');
+        setState(() => _screenState = _ScreenState.idle);
+        return;
+      }
+
+      // 가장 많이 탐지된 YOLO 클래스
+      final dominantYolo =
+          counts.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
+      final mappedModel = _mapYoloClass(dominantYolo);
+      final maxConf = detections.isEmpty
+          ? 0.0
+          : detections
+              .map((d) => (d['confidence'] as num).toDouble())
+              .reduce((a, b) => a > b ? a : b);
+
+      // ── weapons 컬렉션에서 총기 상세 조회 ──
+      // 문서 ID = YOLO 클래스명 (seed_weapons.py와 동일한 키: k1, k2, k2c1)
+      Map<String, dynamic>? weaponDetail;
+      try {
+        final weaponDoc = await FirebaseFirestore.instance
+            .collection('weapons')
+            .doc(dominantYolo) // 예: "k2"
+            .get();
+        if (weaponDoc.exists) weaponDetail = weaponDoc.data();
+      } catch (_) {
+        // weapons 조회 실패는 치명적이지 않으므로 무시하고 계속 진행
+      }
+
+      setState(() {
+        _model = _models.containsKey(mappedModel) ? mappedModel : 'K-2';
+        _qty = counts[dominantYolo] ?? 0;
+        _confidence = maxConf;
+        _annotatedBytes = base64Decode(annotatedB64);
+        _confirmedDetections = detections; // detectionRecords.confirmedDetections
+        _summary = counts;                  // detectionRecords.summary
+        _weaponDetail = weaponDetail;
+        _screenState = _ScreenState.result;
+      });
+    } catch (e) {
+      _showError('서버 연결 실패 — YOLO 서버가 실행 중인지 확인하세요.');
+      setState(() => _screenState = _ScreenState.idle);
+    }
+  }
+
+  // ════════════ 2단계: detectionRecords 스키마로 Firestore 저장 ════════════
+  //
+  // 컬렉션: detectionRecords   (협업 팀 detection_store.py와 동일한 구조)
+  // ┌─────────────────────────┬──────────────────────────────────────────────┐
+  // │ 필드명                  │ 값                                           │
+  // ├─────────────────────────┼──────────────────────────────────────────────┤
+  // │ imageStoragePath        │ "" (Storage 미연동 — 추후 단계에서 채움)     │
+  // │ capturedAt              │ FieldValue.serverTimestamp()                 │
+  // │ confirmedDetections     │ [{"class":"k2","confidence":0.93}, ...]      │
+  // │ summary                 │ {"k2": 3}                                    │
+  // │ modelVersion            │ "firearms_yolo_no_m16"                       │
+  // ├─────────────────────────┼──────────────────────────────────────────────┤
+  // │ (Flutter 추가 필드)      │                                              │
+  // │ weaponType              │ "K-2"  (Flutter 표시명)                      │
+  // │ confirmedQuantity       │ 12     (사용자 최종 확인 수량)               │
+  // │ authorizedQuantity      │ 14     (편제 정수)                           │
+  // │ shortage                │ 2      (부족량, 음수=초과)                   │
+  // │ condition               │ "good" | "repair" | "unusable"               │
+  // │ remarks                 │ 사용자 비고 입력값                           │
+  // └─────────────────────────┴──────────────────────────────────────────────┘
+  Future<void> _saveToFirestore() async {
+    setState(() => _saving = true);
+    try {
+      await FirebaseFirestore.instance.collection('detectionRecords').add({
+        // ── detection_store.py와 동일한 핵심 필드 ──
+        'imageStoragePath': '',
+        'capturedAt': FieldValue.serverTimestamp(),
+        'confirmedDetections': _confirmedDetections,
+        'summary': _summary,
+        'modelVersion': _modelVersion,
+        // ── Flutter에서 추가되는 사용자 확인 데이터 ──
+        'weaponType': _model,
+        'confirmedQuantity': _qty,
+        'authorizedQuantity': _authorized,
+        'shortage': _authorized - _qty,
+        'condition': _condition,
+        'remarks': _remarksController.text.trim(),
+      });
+      if (mounted) _showSaved();
+    } catch (e) {
+      _showError('Firestore 저장 실패 — Firebase 연결을 확인하세요.');
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  void _showError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(message,
+          style: T.sans(
+              size: 14, weight: FontWeight.w500, color: Colors.white)),
+      backgroundColor: AppColors.red,
+      behavior: SnackBarBehavior.floating,
+    ));
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: _captured ? AppColors.bg : const Color(0xFF1B1B1D),
-      body: _captured ? _form() : _viewfinder(),
+      backgroundColor: _screenState == _ScreenState.result
+          ? AppColors.bg
+          : const Color(0xFF1B1B1D),
+      body: switch (_screenState) {
+        _ScreenState.idle => _viewfinder(),
+        _ScreenState.loading => _loadingOverlay(),
+        _ScreenState.result => _form(),
+      },
+    );
+  }
+
+  // ════════════ 로딩 오버레이 ════════════
+  Widget _loadingOverlay() {
+    return SafeArea(
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(
+              width: 52,
+              height: 52,
+              child: CircularProgressIndicator(
+                  color: AppColors.gold, strokeWidth: 3),
+            ),
+            const SizedBox(height: 22),
+            Text('AI 분석 중...',
+                style: T.sans(
+                    size: 16,
+                    weight: FontWeight.w700,
+                    color: AppColors.goldLightest)),
+            const SizedBox(height: 6),
+            Text('YOLO 모델이 총기류를 인식하고 있습니다',
+                style: T.sans(
+                    size: 13,
+                    weight: FontWeight.w500,
+                    color: AppColors.textSub)),
+          ],
+        ),
+      ),
     );
   }
 
@@ -45,27 +267,38 @@ class _CaptureScreenState extends State<CaptureScreen> {
     return SafeArea(
       child: Column(
         children: [
-          // 상단 컨트롤
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 14, 20, 14),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                _roundBtn(Icons.arrow_back_ios_new_rounded, onTap: () => Navigator.pop(context)),
+                _roundBtn(Icons.arrow_back_ios_new_rounded,
+                    onTap: () => Navigator.pop(context)),
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 14, vertical: 7),
                   decoration: BoxDecoration(
                     color: AppColors.gold.withOpacity(0.12),
                     borderRadius: BorderRadius.circular(999),
-                    border: Border.all(color: AppColors.gold.withOpacity(0.28)),
+                    border: Border.all(
+                        color: AppColors.gold.withOpacity(0.28)),
                   ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Container(width: 7, height: 7, decoration: const BoxDecoration(color: AppColors.gold, shape: BoxShape.circle)),
+                      Container(
+                          width: 7,
+                          height: 7,
+                          decoration: const BoxDecoration(
+                              color: AppColors.gold,
+                              shape: BoxShape.circle)),
                       const SizedBox(width: 8),
                       Text('총기 · 재고 점검',
-                          style: T.sans(size: 12.5, weight: FontWeight.w700, color: AppColors.goldLightest, letterSpacing: 0.4)),
+                          style: T.sans(
+                              size: 12.5,
+                              weight: FontWeight.w700,
+                              color: AppColors.goldLightest,
+                              letterSpacing: 0.4)),
                     ],
                   ),
                 ),
@@ -73,7 +306,6 @@ class _CaptureScreenState extends State<CaptureScreen> {
               ],
             ),
           ),
-          // 뷰파인더 영역
           Expanded(
             child: Container(
               margin: const EdgeInsets.fromLTRB(16, 4, 16, 0),
@@ -84,34 +316,40 @@ class _CaptureScreenState extends State<CaptureScreen> {
               clipBehavior: Clip.antiAlias,
               child: Stack(
                 children: [
-                  // 피사체 힌트
                   Center(
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(Icons.crop_free, size: 56, color: AppColors.textMute.withOpacity(0.5)),
+                        Icon(Icons.crop_free,
+                            size: 56,
+                            color: AppColors.textMute.withOpacity(0.5)),
                         const SizedBox(height: 12),
                         Text('[ FRAME SUBJECT ]',
-                            style: T.mono(size: 11, color: AppColors.textMute, letterSpacing: 1.3)),
+                            style: T.mono(
+                                size: 11,
+                                color: AppColors.textMute,
+                                letterSpacing: 1.3)),
                       ],
                     ),
                   ),
-                  // 코너 브래킷
                   ..._corners(),
-                  // 하단 힌트
                   Positioned(
                     left: 0,
                     right: 0,
                     bottom: 22,
                     child: Center(
                       child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 14, vertical: 7),
                         decoration: BoxDecoration(
                           color: const Color(0xA612121A),
                           borderRadius: BorderRadius.circular(999),
                         ),
                         child: Text('품목을 프레임 안에 맞추고 촬영하세요',
-                            style: T.sans(size: 12.5, weight: FontWeight.w500, color: AppColors.textSoft)),
+                            style: T.sans(
+                                size: 12.5,
+                                weight: FontWeight.w500,
+                                color: AppColors.textSoft)),
                       ),
                     ),
                   ),
@@ -119,37 +357,41 @@ class _CaptureScreenState extends State<CaptureScreen> {
               ),
             ),
           ),
-          // 셔터 행
           Padding(
             padding: const EdgeInsets.fromLTRB(36, 24, 36, 42),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Container(
-                  width: 46, height: 46,
-                  decoration: BoxDecoration(color: AppColors.inner, borderRadius: BorderRadius.circular(11), border: Border.all(color: AppColors.border)),
-                ),
+                const SizedBox(width: 46, height: 46),
                 GestureDetector(
-                  onTap: () => setState(() => _captured = true),
+                  onTap: _captureAndDetect,
                   child: Container(
-                    width: 78, height: 78,
+                    width: 78,
+                    height: 78,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      border: Border.all(color: AppColors.gold, width: 3),
+                      border:
+                          Border.all(color: AppColors.gold, width: 3),
                     ),
                     child: Center(
                       child: Container(
-                        width: 62, height: 62,
+                        width: 62,
+                        height: 62,
                         decoration: BoxDecoration(
                           color: AppColors.textPrimary,
                           shape: BoxShape.circle,
-                          boxShadow: [BoxShadow(color: AppColors.gold.withOpacity(0.35), blurRadius: 18)],
+                          boxShadow: [
+                            BoxShadow(
+                                color: AppColors.gold.withOpacity(0.35),
+                                blurRadius: 18)
+                          ],
                         ),
                       ),
                     ),
                   ),
                 ),
-                _roundBtn(Icons.cameraswitch_outlined, iconColor: AppColors.textSub),
+                _roundBtn(Icons.cameraswitch_outlined,
+                    iconColor: AppColors.textSub),
               ],
             ),
           ),
@@ -160,22 +402,41 @@ class _CaptureScreenState extends State<CaptureScreen> {
 
   List<Widget> _corners() {
     const len = 34.0;
-    Widget c({double? top, double? left, double? right, double? bottom, required bool t, required bool l}) {
+    Widget c(
+        {double? top,
+        double? left,
+        double? right,
+        double? bottom,
+        required bool t,
+        required bool l}) {
       return Positioned(
-        top: top, left: left, right: right, bottom: bottom,
+        top: top,
+        left: left,
+        right: right,
+        bottom: bottom,
         child: Container(
-          width: len, height: len,
+          width: len,
+          height: len,
           decoration: BoxDecoration(
             border: Border(
-              top: t ? const BorderSide(color: AppColors.gold, width: 2.5) : BorderSide.none,
-              bottom: !t ? const BorderSide(color: AppColors.gold, width: 2.5) : BorderSide.none,
-              left: l ? const BorderSide(color: AppColors.gold, width: 2.5) : BorderSide.none,
-              right: !l ? const BorderSide(color: AppColors.gold, width: 2.5) : BorderSide.none,
+              top: t
+                  ? const BorderSide(color: AppColors.gold, width: 2.5)
+                  : BorderSide.none,
+              bottom: !t
+                  ? const BorderSide(color: AppColors.gold, width: 2.5)
+                  : BorderSide.none,
+              left: l
+                  ? const BorderSide(color: AppColors.gold, width: 2.5)
+                  : BorderSide.none,
+              right: !l
+                  ? const BorderSide(color: AppColors.gold, width: 2.5)
+                  : BorderSide.none,
             ),
           ),
         ),
       );
     }
+
     return [
       c(top: 18, left: 18, t: true, l: true),
       c(top: 18, right: 18, t: true, l: false),
@@ -184,11 +445,13 @@ class _CaptureScreenState extends State<CaptureScreen> {
     ];
   }
 
-  Widget _roundBtn(IconData icon, {VoidCallback? onTap, Color iconColor = AppColors.textPrimary}) {
+  Widget _roundBtn(IconData icon,
+      {VoidCallback? onTap, Color iconColor = AppColors.textPrimary}) {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        width: 40, height: 40,
+        width: 40,
+        height: 40,
         decoration: BoxDecoration(
           color: const Color(0x12FFFFFF),
           borderRadius: BorderRadius.circular(11),
@@ -202,8 +465,8 @@ class _CaptureScreenState extends State<CaptureScreen> {
   // ════════════ 등록 폼 ════════════
   Widget _form() {
     final shortage = _authorized - _qty;
-    late String statusLabel;
-    late Color statusColor;
+    final String statusLabel;
+    final Color statusColor;
     if (shortage > 0) {
       statusLabel = '부족 $shortage$_unit';
       statusColor = AppColors.terracotta;
@@ -217,33 +480,43 @@ class _CaptureScreenState extends State<CaptureScreen> {
 
     return Column(
       children: [
-        // 헤더
         Container(
           padding: const EdgeInsets.fromLTRB(14, 0, 14, 13),
-          decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: AppColors.borderSoft))),
+          decoration: const BoxDecoration(
+              border: Border(
+                  bottom: BorderSide(color: AppColors.borderSoft))),
           child: SafeArea(
             bottom: false,
             child: Row(
               children: [
-                _smallBtn(Icons.arrow_back_ios_new_rounded, () => setState(() => _captured = false)),
+                _smallBtn(Icons.arrow_back_ios_new_rounded,
+                    () => setState(
+                        () => _screenState = _ScreenState.idle)),
                 const SizedBox(width: 10),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('재고 등록', style: T.sans(size: 18, weight: FontWeight.w800, letterSpacing: -0.2)),
+                      Text('재고 등록',
+                          style: T.sans(
+                              size: 18,
+                              weight: FontWeight.w800,
+                              letterSpacing: -0.2)),
                       const SizedBox(height: 1),
                       Text('정기재물조사 · 진행 12 / 30 품목',
-                          style: T.sans(size: 12, weight: FontWeight.w500, color: AppColors.textSub)),
+                          style: T.sans(
+                              size: 12,
+                              weight: FontWeight.w500,
+                              color: AppColors.textSub)),
                     ],
                   ),
                 ),
-                _smallBtn(Icons.close_rounded, () => Navigator.pop(context)),
+                _smallBtn(Icons.close_rounded,
+                    () => Navigator.pop(context)),
               ],
             ),
           ),
         ),
-        // 스크롤 본문
         Expanded(
           child: ListView(
             padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
@@ -261,33 +534,61 @@ class _CaptureScreenState extends State<CaptureScreen> {
               _quantityCard(statusLabel, statusColor),
               const SizedBox(height: 13),
               _conditionRow(),
+              // weapons 컬렉션 조회 결과 카드 (데이터 있을 때만 표시)
+              if (_weaponDetail != null) ...[
+                const SizedBox(height: 13),
+                _weaponDetailCard(),
+              ],
               const SizedBox(height: 13),
               _noteRow(),
             ],
           ),
         ),
-        // 저장 CTA (레드)
         Container(
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 30),
-          decoration: const BoxDecoration(border: Border(top: BorderSide(color: AppColors.borderSoft))),
+          decoration: const BoxDecoration(
+              border:
+                  Border(top: BorderSide(color: AppColors.borderSoft))),
           child: GestureDetector(
-            onTap: _showSaved,
-            child: Container(
+            onTap: _saving ? null : _saveToFirestore,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 150),
               height: 56,
               decoration: BoxDecoration(
-                color: AppColors.red,
+                color: _saving
+                    ? AppColors.red.withOpacity(0.55)
+                    : AppColors.red,
                 borderRadius: BorderRadius.circular(15),
-                boxShadow: [BoxShadow(color: AppColors.red.withOpacity(0.32), blurRadius: 18, offset: const Offset(0, 4))],
+                boxShadow: _saving
+                    ? null
+                    : [
+                        BoxShadow(
+                            color: AppColors.red.withOpacity(0.32),
+                            blurRadius: 18,
+                            offset: const Offset(0, 4))
+                      ],
               ),
               child: Center(
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(Icons.check_rounded, size: 20, color: Colors.white),
-                    const SizedBox(width: 9),
-                    Text('재고 저장', style: T.sans(size: 16.5, weight: FontWeight.w800, color: Colors.white, letterSpacing: -0.2)),
-                  ],
-                ),
+                child: _saving
+                    ? const SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(
+                            color: Colors.white, strokeWidth: 2.5))
+                    : Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.check_rounded,
+                              size: 20, color: Colors.white),
+                          const SizedBox(width: 9),
+                          Text('재고 저장',
+                              style: T.sans(
+                                  size: 16.5,
+                                  weight: FontWeight.w800,
+                                  color: Colors.white,
+                                  letterSpacing: -0.2)),
+                        ],
+                      ),
               ),
             ),
           ),
@@ -300,8 +601,11 @@ class _CaptureScreenState extends State<CaptureScreen> {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        width: 38, height: 38,
-        decoration: BoxDecoration(color: const Color(0x0FFFFFFF), borderRadius: BorderRadius.circular(10)),
+        width: 38,
+        height: 38,
+        decoration: BoxDecoration(
+            color: const Color(0x0FFFFFFF),
+            borderRadius: BorderRadius.circular(10)),
         child: Icon(icon, size: 16, color: AppColors.textSoft),
       ),
     );
@@ -320,15 +624,24 @@ class _CaptureScreenState extends State<CaptureScreen> {
           Expanded(
             child: Container(
               padding: const EdgeInsets.symmetric(vertical: 10),
-              decoration: BoxDecoration(color: AppColors.chipActive, borderRadius: BorderRadius.circular(10)),
-              child: Center(child: Text('총기류', style: T.sans(size: 14.5, weight: FontWeight.w800))),
+              decoration: BoxDecoration(
+                  color: AppColors.chipActive,
+                  borderRadius: BorderRadius.circular(10)),
+              child: Center(
+                  child: Text('총기류',
+                      style: T.sans(
+                          size: 14.5, weight: FontWeight.w800))),
             ),
           ),
           Expanded(
             child: Padding(
               padding: const EdgeInsets.symmetric(vertical: 10),
               child: Center(
-                child: Text('치장물자 · 준비중', style: T.sans(size: 14.5, weight: FontWeight.w600, color: AppColors.faint)),
+                child: Text('치장물자 · 준비중',
+                    style: T.sans(
+                        size: 14.5,
+                        weight: FontWeight.w600,
+                        color: AppColors.faint)),
               ),
             ),
           ),
@@ -347,45 +660,88 @@ class _CaptureScreenState extends State<CaptureScreen> {
       ),
       clipBehavior: Clip.antiAlias,
       child: Stack(
+        fit: StackFit.expand,
         children: [
-          Center(child: Text('[ 촬영 이미지 ]', style: T.mono(size: 11, color: AppColors.textMute, letterSpacing: 1.1))),
+          if (_annotatedBytes != null)
+            Image.memory(_annotatedBytes!, fit: BoxFit.cover)
+          else
+            Center(
+                child: Text('[ 촬영 이미지 ]',
+                    style: T.mono(
+                        size: 11,
+                        color: AppColors.textMute,
+                        letterSpacing: 1.1))),
           Positioned(
-            top: 12, left: 12,
+            top: 12,
+            left: 12,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-              decoration: BoxDecoration(color: const Color(0xB312121A), borderRadius: BorderRadius.circular(999)),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                  color: const Color(0xB312121A),
+                  borderRadius: BorderRadius.circular(999)),
               child: Row(mainAxisSize: MainAxisSize.min, children: [
-                Container(width: 6, height: 6, decoration: const BoxDecoration(color: AppColors.gold, shape: BoxShape.circle)),
+                Container(
+                    width: 6,
+                    height: 6,
+                    decoration: const BoxDecoration(
+                        color: AppColors.gold,
+                        shape: BoxShape.circle)),
                 const SizedBox(width: 6),
-                Text('AI 인식됨', style: T.sans(size: 11, weight: FontWeight.w700, color: AppColors.goldLightest)),
+                Text('AI 인식됨',
+                    style: T.sans(
+                        size: 11,
+                        weight: FontWeight.w700,
+                        color: AppColors.goldLightest)),
               ]),
             ),
           ),
           Positioned(
-            top: 12, right: 12,
+            top: 12,
+            right: 12,
             child: GestureDetector(
-              onTap: () => setState(() => _captured = false),
+              onTap: () =>
+                  setState(() => _screenState = _ScreenState.idle),
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
-                decoration: BoxDecoration(color: const Color(0xB312121A), borderRadius: BorderRadius.circular(999)),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 11, vertical: 6),
+                decoration: BoxDecoration(
+                    color: const Color(0xB312121A),
+                    borderRadius: BorderRadius.circular(999)),
                 child: Row(mainAxisSize: MainAxisSize.min, children: [
-                  const Icon(Icons.refresh_rounded, size: 12, color: AppColors.textPrimary),
+                  const Icon(Icons.refresh_rounded,
+                      size: 12, color: AppColors.textPrimary),
                   const SizedBox(width: 5),
-                  Text('재촬영', style: T.sans(size: 11, weight: FontWeight.w600)),
+                  Text('재촬영',
+                      style: T.sans(
+                          size: 11, weight: FontWeight.w600)),
                 ]),
               ),
             ),
           ),
           Positioned(
-            bottom: 11, left: 12,
-            child: Text('2026.06.22  09:41', style: T.mono(size: 10.5, color: const Color(0x8CFFFFFF))),
+            bottom: 11,
+            left: 12,
+            child: Text(_nowTimestamp(),
+                style: T.mono(
+                    size: 10.5, color: const Color(0x8CFFFFFF))),
           ),
         ],
       ),
     );
   }
 
+  String _nowTimestamp() {
+    final n = DateTime.now();
+    final mm = n.month.toString().padLeft(2, '0');
+    final dd = n.day.toString().padLeft(2, '0');
+    final hh = n.hour.toString().padLeft(2, '0');
+    final mi = n.minute.toString().padLeft(2, '0');
+    return '${n.year}.$mm.$dd  $hh:$mi';
+  }
+
   Widget _recognizedCard() {
+    final pct = (_confidence * 100).round();
     return _panel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -397,20 +753,35 @@ class _CaptureScreenState extends State<CaptureScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('인식된 품명', style: T.sans(size: 12, weight: FontWeight.w500, color: AppColors.textSub)),
+                    Text('인식된 품명',
+                        style: T.sans(
+                            size: 12,
+                            weight: FontWeight.w500,
+                            color: AppColors.textSub)),
                     const SizedBox(height: 3),
-                    Text(_model, style: T.sans(size: 21, weight: FontWeight.w800, letterSpacing: -0.2)),
+                    Text(_model,
+                        style: T.sans(
+                            size: 21,
+                            weight: FontWeight.w800,
+                            letterSpacing: -0.2)),
                   ],
                 ),
               ),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 12, vertical: 6),
                 decoration: BoxDecoration(
                   color: AppColors.red.withOpacity(0.16),
                   borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: AppColors.red.withOpacity(0.4)),
+                  border: Border.all(
+                      color: AppColors.red.withOpacity(0.4)),
                 ),
-                child: Text('총기', style: T.sans(size: 12, weight: FontWeight.w800, color: AppColors.terracotta, letterSpacing: 0.3)),
+                child: Text('총기',
+                    style: T.sans(
+                        size: 12,
+                        weight: FontWeight.w800,
+                        color: AppColors.terracotta,
+                        letterSpacing: 0.3)),
               ),
             ],
           ),
@@ -420,15 +791,21 @@ class _CaptureScreenState extends State<CaptureScreen> {
               Expanded(
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(3),
-                  child: const LinearProgressIndicator(
-                    value: 0.96, minHeight: 5,
-                    backgroundColor: Color(0x14FFFFFF),
-                    valueColor: AlwaysStoppedAnimation(AppColors.gold),
+                  child: LinearProgressIndicator(
+                    value: _confidence,
+                    minHeight: 5,
+                    backgroundColor: const Color(0x14FFFFFF),
+                    valueColor:
+                        const AlwaysStoppedAnimation(AppColors.gold),
                   ),
                 ),
               ),
               const SizedBox(width: 10),
-              Text('신뢰도 96%', style: T.mono(size: 12, weight: FontWeight.w600, color: AppColors.goldLight)),
+              Text('신뢰도 $pct%',
+                  style: T.mono(
+                      size: 12,
+                      weight: FontWeight.w600,
+                      color: AppColors.goldLight)),
             ],
           ),
         ],
@@ -444,8 +821,16 @@ class _CaptureScreenState extends State<CaptureScreen> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text('인식 기종 (탭하여 수정)', style: T.sans(size: 12, weight: FontWeight.w500, color: AppColors.textSub)),
-              Text('학습 기종 4종', style: T.sans(size: 11, weight: FontWeight.w700, color: AppColors.textSub)),
+              Text('인식 기종 (탭하여 수정)',
+                  style: T.sans(
+                      size: 12,
+                      weight: FontWeight.w500,
+                      color: AppColors.textSub)),
+              Text('학습 기종 3종',
+                  style: T.sans(
+                      size: 11,
+                      weight: FontWeight.w700,
+                      color: AppColors.textSub)),
             ],
           ),
           const SizedBox(height: 11),
@@ -453,7 +838,8 @@ class _CaptureScreenState extends State<CaptureScreen> {
             children: [
               for (final name in _models.keys) ...[
                 _modelChip(name),
-                if (name != _models.keys.last) const SizedBox(width: 8),
+                if (name != _models.keys.last)
+                  const SizedBox(width: 8),
               ],
             ],
           ),
@@ -466,19 +852,25 @@ class _CaptureScreenState extends State<CaptureScreen> {
     final active = _model == name;
     return Expanded(
       child: GestureDetector(
-        onTap: () => setState(() {
-          _model = name;
-          _qty = _authorized; // 기종 변경 시 현재고를 편제 정수로 초기화
-        }),
+        onTap: () => setState(() => _model = name),
         child: Container(
           padding: const EdgeInsets.symmetric(vertical: 11),
           decoration: BoxDecoration(
-            color: active ? AppColors.gold.withOpacity(0.16) : AppColors.cardAlt,
+            color: active
+                ? AppColors.gold.withOpacity(0.16)
+                : AppColors.cardAlt,
             borderRadius: BorderRadius.circular(11),
-            border: Border.all(color: active ? AppColors.gold : AppColors.chipActive),
+            border: Border.all(
+                color: active ? AppColors.gold : AppColors.chipActive),
           ),
           child: Center(
-            child: Text(name, style: T.mono(size: 13.5, weight: FontWeight.w700, color: active ? AppColors.goldLight : AppColors.textSub)),
+            child: Text(name,
+                style: T.mono(
+                    size: 13.5,
+                    weight: FontWeight.w700,
+                    color: active
+                        ? AppColors.goldLight
+                        : AppColors.textSub)),
           ),
         ),
       ),
@@ -493,19 +885,35 @@ class _CaptureScreenState extends State<CaptureScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('총번 (Serial No.)', style: T.sans(size: 12, weight: FontWeight.w500, color: AppColors.textSub)),
+                Text('총번 (Serial No.)',
+                    style: T.sans(
+                        size: 12,
+                        weight: FontWeight.w500,
+                        color: AppColors.textSub)),
                 const SizedBox(height: 5),
-                Text(_serial, style: T.mono(size: 18, weight: FontWeight.w600, letterSpacing: 0.7)),
+                Text(_serial,
+                    style: T.mono(
+                        size: 18,
+                        weight: FontWeight.w600,
+                        letterSpacing: 0.7)),
               ],
             ),
           ),
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 8),
-            decoration: BoxDecoration(color: const Color(0x0FFFFFFF), borderRadius: BorderRadius.circular(9)),
+            padding: const EdgeInsets.symmetric(
+                horizontal: 13, vertical: 8),
+            decoration: BoxDecoration(
+                color: const Color(0x0FFFFFFF),
+                borderRadius: BorderRadius.circular(9)),
             child: Row(mainAxisSize: MainAxisSize.min, children: [
-              const Icon(Icons.edit_outlined, size: 13, color: AppColors.textSoft),
+              const Icon(Icons.edit_outlined,
+                  size: 13, color: AppColors.textSoft),
               const SizedBox(width: 5),
-              Text('수정', style: T.sans(size: 13, weight: FontWeight.w600, color: AppColors.textSoft)),
+              Text('수정',
+                  style: T.sans(
+                      size: 13,
+                      weight: FontWeight.w600,
+                      color: AppColors.textSoft)),
             ]),
           ),
         ],
@@ -519,7 +927,11 @@ class _CaptureScreenState extends State<CaptureScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('현재고 수량 입력', style: T.sans(size: 12, weight: FontWeight.w500, color: AppColors.textSub)),
+          Text('현재고 수량',
+              style: T.sans(
+                  size: 12,
+                  weight: FontWeight.w500,
+                  color: AppColors.textSub)),
           const SizedBox(height: 14),
           Row(
             children: [
@@ -527,8 +939,18 @@ class _CaptureScreenState extends State<CaptureScreen> {
               Expanded(
                 child: Center(
                   child: Text.rich(TextSpan(children: [
-                    TextSpan(text: '$_qty', style: T.mono(size: 46, weight: FontWeight.w700, letterSpacing: -1)),
-                    TextSpan(text: ' $_unit', style: T.sans(size: 18, weight: FontWeight.w600, color: AppColors.textSub)),
+                    TextSpan(
+                        text: '$_qty',
+                        style: T.mono(
+                            size: 46,
+                            weight: FontWeight.w700,
+                            letterSpacing: -1)),
+                    TextSpan(
+                        text: ' $_unit',
+                        style: T.sans(
+                            size: 18,
+                            weight: FontWeight.w600,
+                            color: AppColors.textSub)),
                   ])),
                 ),
               ),
@@ -538,19 +960,41 @@ class _CaptureScreenState extends State<CaptureScreen> {
           const SizedBox(height: 16),
           Container(
             padding: const EdgeInsets.only(top: 14),
-            decoration: const BoxDecoration(border: Border(top: BorderSide(color: AppColors.borderSoft))),
+            decoration: const BoxDecoration(
+                border: Border(
+                    top: BorderSide(color: AppColors.borderSoft))),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text.rich(TextSpan(children: [
-                  TextSpan(text: '편제 정수  ', style: T.sans(size: 13, weight: FontWeight.w500, color: AppColors.textSub)),
-                  TextSpan(text: '$_authorized', style: T.mono(size: 16, weight: FontWeight.w600)),
-                  TextSpan(text: ' $_unit', style: T.sans(size: 13, weight: FontWeight.w500, color: AppColors.textSub)),
+                  TextSpan(
+                      text: '편제 정수  ',
+                      style: T.sans(
+                          size: 13,
+                          weight: FontWeight.w500,
+                          color: AppColors.textSub)),
+                  TextSpan(
+                      text: '$_authorized',
+                      style: T.mono(
+                          size: 16, weight: FontWeight.w600)),
+                  TextSpan(
+                      text: ' $_unit',
+                      style: T.sans(
+                          size: 13,
+                          weight: FontWeight.w500,
+                          color: AppColors.textSub)),
                 ])),
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
-                  decoration: BoxDecoration(color: statusColor.withOpacity(0.16), borderRadius: BorderRadius.circular(999)),
-                  child: Text(statusLabel, style: T.sans(size: 13, weight: FontWeight.w700, color: statusColor)),
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 13, vertical: 6),
+                  decoration: BoxDecoration(
+                      color: statusColor.withOpacity(0.16),
+                      borderRadius: BorderRadius.circular(999)),
+                  child: Text(statusLabel,
+                      style: T.sans(
+                          size: 13,
+                          weight: FontWeight.w700,
+                          color: statusColor)),
                 ),
               ],
             ),
@@ -562,16 +1006,30 @@ class _CaptureScreenState extends State<CaptureScreen> {
 
   Widget _stepBtn(bool plus) {
     return GestureDetector(
-      onTap: () => setState(() => _qty = plus ? _qty + 1 : (_qty - 1).clamp(0, 999)),
+      onTap: () => setState(
+          () => _qty = plus ? _qty + 1 : (_qty - 1).clamp(0, 999)),
       child: Container(
-        width: 54, height: 54,
+        width: 54,
+        height: 54,
         decoration: BoxDecoration(
           color: plus ? AppColors.gold : AppColors.chipActive,
           borderRadius: BorderRadius.circular(14),
           border: plus ? null : Border.all(color: AppColors.border),
-          boxShadow: plus ? [BoxShadow(color: AppColors.gold.withOpacity(0.25), blurRadius: 10, offset: const Offset(0, 2))] : null,
+          boxShadow: plus
+              ? [
+                  BoxShadow(
+                      color: AppColors.gold.withOpacity(0.25),
+                      blurRadius: 10,
+                      offset: const Offset(0, 2))
+                ]
+              : null,
         ),
-        child: Icon(plus ? Icons.add_rounded : Icons.remove_rounded, size: 22, color: plus ? const Color(0xFF2A2310) : AppColors.textPrimary),
+        child: Icon(
+            plus ? Icons.add_rounded : Icons.remove_rounded,
+            size: 22,
+            color: plus
+                ? const Color(0xFF2A2310)
+                : AppColors.textPrimary),
       ),
     );
   }
@@ -582,7 +1040,11 @@ class _CaptureScreenState extends State<CaptureScreen> {
       children: [
         Padding(
           padding: const EdgeInsets.fromLTRB(2, 2, 2, 9),
-          child: Text('상태 판정', style: T.sans(size: 12, weight: FontWeight.w500, color: AppColors.textSub)),
+          child: Text('상태 판정',
+              style: T.sans(
+                  size: 12,
+                  weight: FontWeight.w500,
+                  color: AppColors.textSub)),
         ),
         Row(
           children: [
@@ -605,31 +1067,175 @@ class _CaptureScreenState extends State<CaptureScreen> {
         child: Container(
           padding: const EdgeInsets.symmetric(vertical: 13),
           decoration: BoxDecoration(
-            color: active ? color.withOpacity(0.14) : AppColors.cardAlt,
+            color:
+                active ? color.withOpacity(0.14) : AppColors.cardAlt,
             borderRadius: BorderRadius.circular(13),
-            border: Border.all(color: active ? color : AppColors.chipActive),
+            border: Border.all(
+                color: active ? color : AppColors.chipActive),
           ),
           child: Center(
-            child: Text(label, style: T.sans(size: 14.5, weight: FontWeight.w700, color: active ? color : AppColors.textSub)),
+            child: Text(label,
+                style: T.sans(
+                    size: 14.5,
+                    weight: FontWeight.w700,
+                    color: active ? color : AppColors.textSub)),
           ),
         ),
       ),
     );
   }
 
+  // ════════════ weapons 컬렉션 조회 결과 카드 ════════════
+  // weapons/{yolo_class_id} 문서의 officialName, type, caliber,
+  // manufacturer, description 필드를 표시한다.
+  Widget _weaponDetailCard() {
+    final d = _weaponDetail!;
+    final officialName = d['officialName'] as String? ?? _model;
+    final type = d['type'] as String? ?? '-';
+    final caliber = d['caliber'] as String? ?? '-';
+    final manufacturer = d['manufacturer'] as String? ?? '-';
+    final description = d['description'] as String? ?? '';
+
+    return _panel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // 헤더
+          Row(
+            children: [
+              Container(
+                width: 28,
+                height: 28,
+                decoration: BoxDecoration(
+                  color: AppColors.gold.withOpacity(0.14),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(Icons.military_tech_rounded,
+                    size: 15, color: AppColors.goldLight),
+              ),
+              const SizedBox(width: 10),
+              Text('총기 제원 정보',
+                  style: T.sans(
+                      size: 13,
+                      weight: FontWeight.w700,
+                      color: AppColors.goldLight)),
+              const Spacer(),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: const Color(0x0DFFFFFF),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text('Firestore',
+                    style: T.mono(
+                        size: 10,
+                        weight: FontWeight.w500,
+                        color: AppColors.textMute)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          // 제원 테이블
+          _specRow('공식 명칭', officialName),
+          _specDivider(),
+          _specRow('분류', type),
+          _specDivider(),
+          _specRow('구경', caliber),
+          _specDivider(),
+          _specRow('제조사', manufacturer),
+          // 설명
+          if (description.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: AppColors.inner,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Text(
+                description,
+                style: T.sans(
+                    size: 12.5,
+                    weight: FontWeight.w500,
+                    color: AppColors.textSub,
+                    height: 1.65),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _specRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 64,
+            child: Text(label,
+                style: T.sans(
+                    size: 12,
+                    weight: FontWeight.w500,
+                    color: AppColors.textMute)),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(value,
+                style: T.sans(
+                    size: 13,
+                    weight: FontWeight.w600,
+                    color: AppColors.textPrimary)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _specDivider() =>
+      const Divider(height: 1, color: AppColors.borderSoft);
+
+  // ════════════ 비고 입력 TextField ════════════
   Widget _noteRow() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 14),
+      padding: const EdgeInsets.fromLTRB(15, 4, 15, 4),
       decoration: BoxDecoration(
         color: AppColors.cardAlt,
         borderRadius: BorderRadius.circular(14),
         border: Border.all(color: AppColors.borderSoft),
       ),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          const Icon(Icons.description_outlined, size: 16, color: AppColors.textMute),
+          const Icon(Icons.description_outlined,
+              size: 16, color: AppColors.textMute),
           const SizedBox(width: 10),
-          Text('비고 입력 (탄약고 위치, 결손 사유 등)', style: T.sans(size: 14, weight: FontWeight.w500, color: AppColors.textMute)),
+          Expanded(
+            child: TextField(
+              controller: _remarksController,
+              style: T.sans(
+                  size: 14,
+                  weight: FontWeight.w500,
+                  color: AppColors.textPrimary),
+              cursorColor: AppColors.gold,
+              maxLines: null,
+              decoration: InputDecoration(
+                hintText: '비고 입력 (탄약고 위치, 결손 사유 등)',
+                hintStyle: T.sans(
+                    size: 14,
+                    weight: FontWeight.w500,
+                    color: AppColors.textMute),
+                border: InputBorder.none,
+                isDense: true,
+                contentPadding:
+                    const EdgeInsets.symmetric(vertical: 10),
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -666,30 +1272,54 @@ class _CaptureScreenState extends State<CaptureScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               Container(
-                width: 68, height: 68,
+                width: 68,
+                height: 68,
                 decoration: BoxDecoration(
                   color: AppColors.gold.withOpacity(0.16),
                   shape: BoxShape.circle,
-                  border: Border.all(color: AppColors.gold.withOpacity(0.4)),
+                  border: Border.all(
+                      color: AppColors.gold.withOpacity(0.4)),
                 ),
-                child: const Icon(Icons.check_rounded, size: 32, color: AppColors.goldLight),
+                child: const Icon(Icons.check_rounded,
+                    size: 32, color: AppColors.goldLight),
               ),
               const SizedBox(height: 18),
-              Text('저장 완료', style: T.sans(size: 21, weight: FontWeight.w800)),
+              Text('저장 완료',
+                  style: T.sans(size: 21, weight: FontWeight.w800)),
               const SizedBox(height: 6),
               Text('$_model · $_qty$_unit\n재물조사 대장에 기록되었습니다',
                   textAlign: TextAlign.center,
-                  style: T.sans(size: 14, weight: FontWeight.w500, color: AppColors.textSub, height: 1.5)),
+                  style: T.sans(
+                      size: 14,
+                      weight: FontWeight.w500,
+                      color: AppColors.textSub,
+                      height: 1.5)),
               const SizedBox(height: 22),
               GestureDetector(
                 onTap: () {
                   Navigator.pop(ctx);
-                  setState(() => _captured = false);
+                  setState(() {
+                    _screenState = _ScreenState.idle;
+                    _annotatedBytes = null;
+                    _confidence = 0.0;
+                    _qty = 0;
+                    _confirmedDetections = [];
+                    _summary = {};
+                    _weaponDetail = null;
+                    _remarksController.clear();
+                  });
                 },
                 child: Container(
                   height: 52,
-                  decoration: BoxDecoration(color: AppColors.gold, borderRadius: BorderRadius.circular(14)),
-                  child: Center(child: Text('다음 품목 촬영', style: T.sans(size: 15.5, weight: FontWeight.w800, color: const Color(0xFF2A2310)))),
+                  decoration: BoxDecoration(
+                      color: AppColors.gold,
+                      borderRadius: BorderRadius.circular(14)),
+                  child: Center(
+                      child: Text('다음 품목 촬영',
+                          style: T.sans(
+                              size: 15.5,
+                              weight: FontWeight.w800,
+                              color: const Color(0xFF2A2310)))),
                 ),
               ),
               const SizedBox(height: 9),
@@ -700,8 +1330,15 @@ class _CaptureScreenState extends State<CaptureScreen> {
                 },
                 child: Container(
                   height: 48,
-                  decoration: BoxDecoration(color: const Color(0x0DFFFFFF), borderRadius: BorderRadius.circular(14)),
-                  child: Center(child: Text('조사 목록 보기', style: T.sans(size: 15, weight: FontWeight.w600, color: AppColors.textSoft))),
+                  decoration: BoxDecoration(
+                      color: const Color(0x0DFFFFFF),
+                      borderRadius: BorderRadius.circular(14)),
+                  child: Center(
+                      child: Text('조사 목록 보기',
+                          style: T.sans(
+                              size: 15,
+                              weight: FontWeight.w600,
+                              color: AppColors.textSoft))),
                 ),
               ),
             ],

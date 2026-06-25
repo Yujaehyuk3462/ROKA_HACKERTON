@@ -1,3 +1,4 @@
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 
 import 'theme.dart';
@@ -8,7 +9,11 @@ import 'screens/settings_screen.dart';
 import 'screens/capture_screen.dart';
 import 'widgets/bottom_nav.dart';
 
-void main() => runApp(const DefenseInventoryApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  runApp(const DefenseInventoryApp());
+}
 
 class DefenseInventoryApp extends StatelessWidget {
   const DefenseInventoryApp({super.key});

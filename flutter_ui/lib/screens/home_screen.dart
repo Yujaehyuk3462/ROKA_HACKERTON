@@ -68,9 +68,9 @@ class HomeScreen extends StatelessWidget {
   Widget _statTiles() {
     return Row(
       children: [
-        _tile('4', '총 기종'),
+        _tile('3', '총 기종'),
         const SizedBox(width: 8),
-        _tile('2', '점검 완료', accent: AppColors.gold, bg: AppColors.gold.withOpacity(0.16)),
+        _tile('1', '점검 완료', accent: AppColors.gold, bg: AppColors.gold.withOpacity(0.16)),
         const SizedBox(width: 8),
         _tile('2', '미점검'),
         const SizedBox(width: 8),
@@ -250,8 +250,6 @@ class HomeScreen extends StatelessWidget {
                 _bar('K-1A 소총', 8, 8),
                 const SizedBox(height: 16),
                 _bar('K2C1 소총', 9, 10, short: true),
-                const SizedBox(height: 16),
-                _bar('M16A1 소총', 6, 6),
               ],
             ),
           ),

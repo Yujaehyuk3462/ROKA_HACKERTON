@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "925288025067",
+    "project_id": "roka-hackathon",
+    "storage_bucket": "roka-hackathon.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:925288025067:android:f9e520dc259f0842a527ae",
+        "android_client_info": {
+          "package_name": "com.example.defense_inventory"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDd4g4iB8xX8OL6pcbrEEwUvg1MrWNEuR0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
