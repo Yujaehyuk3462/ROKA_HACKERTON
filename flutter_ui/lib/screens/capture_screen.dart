@@ -58,7 +58,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
   int get _authorized => _weaponMap[_model]?.authorizedQuantity ?? 0;
   String get _serial => _defaultSerials[_model] ?? '-';
   static const _unit = '정';
-  static const _serverUrl = 'http://192.168.45.16:8000/detect';
+  static const _serverUrl = 'https://roka-hackerton-925288025067.asia-northeast3.run.app/detect';
   static const _modelVersion = 'firearms_yolo_no_m16';
 
   @override
