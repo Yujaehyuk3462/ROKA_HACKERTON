@@ -3,7 +3,7 @@ import 'package:flutter/foundation.dart';
 @immutable
 class Weapon {
   final String code;             // Firestore 문서 ID: k1 / k2 / k2c1
-  final String displayName;     // Flutter 표시명: K-1A / K-2 / K2C1
+  final String displayName;     // Flutter 표시명: K1 / K2 / K2C1
   final String officialName;
   final String type;
   final String caliber;
@@ -39,18 +39,18 @@ class Weapon {
 
   /// YOLO 클래스명(소문자) → Flutter 표시명
   static String yoloToDisplayName(String code) =>
-      switch (code.toLowerCase()) {
-        'k2' => 'K-2',
-        'k1' => 'K-1A',
+      switch (code.toLowerCase().replaceAll(RegExp(r'[-_]'), '')) {
+        'k2' => 'K2',
+        'k1' || 'k1a' => 'K1',
         'k2c1' => 'K2C1',
         _ => code.toUpperCase(),
       };
 
   /// Firestore 응답 전까지 즉시 렌더링에 사용하는 폴백 데이터
   static const Map<String, Weapon> fallbacks = {
-    'K-2': Weapon(
+    'K2': Weapon(
       code: 'k2',
-      displayName: 'K-2',
+      displayName: 'K2',
       officialName: 'K2 소총',
       type: '돌격소총',
       caliber: '5.56x45mm NATO',
@@ -58,9 +58,9 @@ class Weapon {
       description: '',
       authorizedQuantity: 14,
     ),
-    'K-1A': Weapon(
+    'K1': Weapon(
       code: 'k1',
-      displayName: 'K-1A',
+      displayName: 'K1',
       officialName: 'K1 기관단총',
       type: '기관단총',
       caliber: '5.56x45mm',

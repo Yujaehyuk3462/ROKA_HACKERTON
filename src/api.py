@@ -10,12 +10,21 @@ sys.path.insert(0, str(Path(__file__).parent))
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
 
+from ocr_utils import recognize_serials_for_result
 from pipeline import DEFAULT_WEIGHTS, detect_firearms, load_model
 
 app = FastAPI(title="ROKA 총기류 탐지 API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 _model = None
 
@@ -38,7 +47,7 @@ def health():
 
 
 @app.post("/detect")
-async def detect(file: UploadFile = File(...), conf: float = 0.7):
+async def detect(file: UploadFile = File(...), conf: float = 0.7, read_serial: bool = True):
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="이미지 파일만 업로드 가능합니다.")
 
@@ -50,10 +59,20 @@ async def detect(file: UploadFile = File(...), conf: float = 0.7):
     counts, results = detect_firearms(model, img_array, conf=conf)
 
     result = results[0]
+    if read_serial and len(result.boxes) > 0:
+        serials = recognize_serials_for_result(result)
+    else:
+        serials = [{"text": None, "confidence": 0.0}] * len(result.boxes)
+
     detections = [
-        {"class": model.names[int(cls_id)], "confidence": round(float(conf_val), 4)}
-        for cls_id, conf_val in zip(
-            result.boxes.cls.tolist(), result.boxes.conf.tolist()
+        {
+            "class": model.names[int(cls_id)],
+            "confidence": round(float(conf_val), 4),
+            "serialNumber": serial["text"],
+            "serialConfidence": serial["confidence"],
+        }
+        for cls_id, conf_val, serial in zip(
+            result.boxes.cls.tolist(), result.boxes.conf.tolist(), serials
         )
     ]
 

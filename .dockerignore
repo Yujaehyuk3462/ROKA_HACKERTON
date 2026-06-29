@@ -1,0 +1,26 @@
+# Flutter app
+flutter_ui/
+
+# Python caches
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Training artifacts (불필요 — serial_yolo.pt 만 필요)
+src/serial_dataset/
+src/runs/
+src/train_serial.py
+
+# Git / IDE
+.git/
+.gitignore
+*.md
+.vscode/
+.idea/
+
+# Data / notebooks
+data/
+db/
+requirements.txt
+hakertonProject.py
+yolov8n.pt

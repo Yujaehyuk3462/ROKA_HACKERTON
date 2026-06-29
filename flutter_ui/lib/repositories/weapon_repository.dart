@@ -6,7 +6,7 @@ class WeaponRepository {
 
   static final _col = FirebaseFirestore.instance.collection('weapons');
 
-  /// weapons 컬렉션 전체를 displayName(K-2 등) 키로 실시간 스트리밍
+  /// weapons 컬렉션 전체를 displayName(K2 등) 키로 실시간 스트리밍
   static Stream<Map<String, Weapon>> watchAllByDisplayName() =>
       _col.snapshots().map((snap) {
         final map = <String, Weapon>{};

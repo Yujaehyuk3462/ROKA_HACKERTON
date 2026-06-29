@@ -7,6 +7,7 @@ import '../models/weapon.dart';
 import '../repositories/weapon_repository.dart';
 import '../theme.dart';
 import 'capture_screen.dart';
+import 'inventory_list_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -19,13 +20,13 @@ class _HomeScreenState extends State<HomeScreen> {
   // ── Firestore 스트림 데이터 ────────────────────────────
   Map<String, Weapon> _weaponMap = Map.of(Weapon.fallbacks);
 
-  /// weaponType(K-2 등) 키 → 해당 기종의 가장 최신 detectionRecords 문서
+  /// weaponType(K2 등) 키 → 해당 기종의 가장 최신 detectionRecords 문서
   Map<String, Map<String, dynamic>> _latestByType = {};
 
   StreamSubscription<Map<String, Weapon>>? _weaponSub;
   StreamSubscription<QuerySnapshot>? _recordsSub;
 
-  static const _weaponOrder = ['K-2', 'K-1A', 'K2C1'];
+  static const _weaponOrder = ['K2', 'K1', 'K2C1'];
 
   // ── 파생 수치 ────────────────────────────────────────────
   int get _inspectedCount => _latestByType.length;
@@ -38,10 +39,13 @@ class _HomeScreenState extends State<HomeScreen> {
   int _confirmedQty(String displayName) =>
       (_latestByType[displayName]?['confirmedQuantity'] as num?)?.toInt() ?? 0;
 
-  int _authorizedQty(String displayName) =>
-      (_latestByType[displayName]?['authorizedQuantity'] as num?)?.toInt()
-      ?? _weaponMap[displayName]?.authorizedQuantity
-      ?? 0;
+  int _authorizedQty(String displayName) {
+    final stored =
+        (_latestByType[displayName]?['authorizedQuantity'] as num?)?.toInt() ??
+            0;
+    if (stored > 0) return stored;
+    return _weaponMap[displayName]?.authorizedQuantity ?? 0;
+  }
 
   bool _isShort(String displayName) =>
       ((_latestByType[displayName]?['shortage'] as num?)?.toInt() ?? 0) > 0;
@@ -63,7 +67,11 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
 
     _weaponSub = WeaponRepository.watchAllByDisplayName().listen(
-      (map) { if (mounted) setState(() => _weaponMap = map); },
+      (map) {
+        if (mounted) {
+          setState(() => _weaponMap = {...Weapon.fallbacks, ...map});
+        }
+      },
       onError: (_) {},
     );
 
@@ -119,10 +127,10 @@ class _HomeScreenState extends State<HomeScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('행정보급관님',
+          Text('김보급 상사',
               style: T.sans(size: 23, weight: FontWeight.w800, letterSpacing: -0.2)),
           const SizedBox(height: 4),
-          Text('제0000부대 · 정기재물조사 진행중',
+          Text('행정보급관 · 제0000부대 보급대',
               style: T.sans(size: 13, weight: FontWeight.w500, color: AppColors.textSub)),
           const SizedBox(height: 18),
           _datePill(),
@@ -292,11 +300,17 @@ class _HomeScreenState extends State<HomeScreen> {
                             color: AppColors.terracotta)),
                   ],
                 ),
-                Text('전체보기',
-                    style: T.sans(
-                        size: 13,
-                        weight: FontWeight.w500,
-                        color: AppColors.textSub)),
+                GestureDetector(
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                        builder: (_) => const InventoryListScreen()),
+                  ),
+                  child: Text('전체보기',
+                      style: T.sans(
+                          size: 13,
+                          weight: FontWeight.w500,
+                          color: AppColors.textSub)),
+                ),
               ],
             ),
           ),
